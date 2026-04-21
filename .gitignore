@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data
+data/
+*.csv
+
+# Models
+models/
+*.pkl
+*.joblib
+*.model
+
+# Logs
+*.log
+
+# Env
+.env
+
+# OS
+.DS_Store
+Thumbs.db
