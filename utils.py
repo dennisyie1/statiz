@@ -1919,3 +1919,145 @@ def build_season_pit_df_from_model_dfs(df_dict: dict[int, pd.DataFrame]) -> pd.D
     season_pit_df = season_pit_df.sort_values(["year", "player_id"]).reset_index(drop=True)
 
     return season_pit_df
+
+
+# reduced core 모델은 최근 흐름 feature가 필요하므로 pred_df에 붙인다.
+# 학습 때와 동일하게 각 팀의 예측 경기 이전 완료 경기만 사용한다.
+from datetime import timedelta
+
+
+def make_team_game_log_for_recent(games_df: pd.DataFrame) -> pd.DataFrame:
+    games = games_df.copy()
+    games["game_id"] = games["game_id"].astype(str)
+    games["game_date"] = pd.to_datetime(games["game_date"], errors="coerce")
+    games["home_team_code"] = games["home_team_code"].astype(str)
+    games["away_team_code"] = games["away_team_code"].astype(str)
+    games["home_score"] = pd.to_numeric(games["home_score"], errors="coerce")
+    games["away_score"] = pd.to_numeric(games["away_score"], errors="coerce")
+
+    games = games[
+        (games["game_state"] == 3)
+        & games["home_score"].notna()
+        & games["away_score"].notna()
+    ].copy()
+
+    home_log = games[["game_id", "game_date", "season", "home_team_code", "away_team_code", "home_score", "away_score"]].copy()
+    home_log = home_log.rename(columns={"home_team_code": "team_code", "away_team_code": "opp_team_code"})
+    home_log["runs_for"] = home_log["home_score"]
+    home_log["runs_against"] = home_log["away_score"]
+    home_log["win"] = (home_log["home_score"] > home_log["away_score"]).astype(int)
+
+    away_log = games[["game_id", "game_date", "season", "away_team_code", "home_team_code", "away_score", "home_score"]].copy()
+    away_log = away_log.rename(columns={"away_team_code": "team_code", "home_team_code": "opp_team_code", "away_score": "team_score", "home_score": "opp_score"})
+    away_log["runs_for"] = away_log["team_score"]
+    away_log["runs_against"] = away_log["opp_score"]
+    away_log["win"] = (away_log["team_score"] > away_log["opp_score"]).astype(int)
+    away_log = away_log[["game_id", "game_date", "season", "team_code", "opp_team_code", "runs_for", "runs_against", "win"]]
+
+    home_log = home_log[["game_id", "game_date", "season", "team_code", "opp_team_code", "runs_for", "runs_against", "win"]]
+    team_log = pd.concat([home_log, away_log], ignore_index=True)
+    team_log = team_log.sort_values(["team_code", "game_date", "game_id"]).reset_index(drop=True)
+    return team_log
+
+
+def build_team_recent_snapshot(games_df: pd.DataFrame, as_of_date, windows=(5, 10)) -> pd.DataFrame:
+    as_of_date = pd.to_datetime(as_of_date).normalize()
+    team_log = make_team_game_log_for_recent(games_df)
+    team_log = team_log[team_log["game_date"].dt.normalize() < as_of_date].copy()
+
+    if team_log.empty:
+        return pd.DataFrame(columns=["team_code"])
+
+    team_log = team_log.sort_values(["team_code", "game_date", "game_id"]).copy()
+    team_log["run_diff"] = team_log["runs_for"] - team_log["runs_against"]
+
+    for window in windows:
+        for src_col, out_name in [
+            ("win", "win_rate"),
+            ("runs_for", "runs_for_avg"),
+            ("runs_against", "runs_against_avg"),
+            ("run_diff", "run_diff_avg"),
+        ]:
+            team_log[f"recent_{window}_{out_name}"] = (
+                team_log.groupby("team_code")[src_col]
+                .transform(lambda s: s.shift(1).rolling(window, min_periods=1).mean())
+            )
+
+    team_log["prev_game_date"] = team_log.groupby("team_code")["game_date"].shift(1)
+    team_log["rest_days"] = (team_log["game_date"] - team_log["prev_game_date"]).dt.days
+    team_log["prev_game_win"] = team_log.groupby("team_code")["win"].shift(1)
+
+    feature_cols = [c for c in team_log.columns if c.startswith("recent_")] + ["rest_days", "prev_game_win"]
+    latest = (
+        team_log.sort_values(["team_code", "game_date", "game_id"])
+        .groupby("team_code", as_index=False)
+        .tail(1)
+        [["team_code"] + feature_cols]
+        .copy()
+    )
+    return latest
+
+import joblib
+feature_cols_core = joblib.load("feature_cols_reduced_core.pkl")
+def add_recent_flow_features_for_prediction(pred_df: pd.DataFrame, season_start=None, sleep_sec=0.2) -> pd.DataFrame:
+    out = pred_df.copy()
+    out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce")
+    target_date = out["game_date"].min().normalize()
+
+    if season_start is None:
+        # 2026 KBO 정규시즌 시작일 기준. 다른 시즌이면 필요시 season_start만 바꿔준다.
+        season_start = f"{int(out['season'].iloc[0])}-03-22"
+
+    date_list = pd.date_range(pd.to_datetime(season_start), target_date - timedelta(days=1), freq="D").strftime("%Y-%m-%d").tolist()
+    if len(date_list) == 0:
+        for col in [c for c in feature_cols_core if c.startswith("recent_") or c in ["rest_days_diff", "prev_game_win_diff"]]:
+            out[col] = 0
+        return out
+
+    past_games = collect_games(date_list, sleep_sec=sleep_sec)
+    recent_snapshot = build_team_recent_snapshot(past_games, target_date, windows=(5, 10))
+
+    recent_base_cols = [
+        "recent_5_win_rate",
+        "recent_5_runs_for_avg",
+        "recent_5_runs_against_avg",
+        "recent_5_run_diff_avg",
+        "recent_10_win_rate",
+        "recent_10_runs_for_avg",
+        "recent_10_runs_against_avg",
+        "recent_10_run_diff_avg",
+    ]
+    recent_cols = [
+        c for c in recent_base_cols + ["rest_days", "prev_game_win"]
+        if c in recent_snapshot.columns
+    ]
+    home_recent = recent_snapshot.rename(columns={"team_code": "home_team_code", **{c: f"home_{c}" for c in recent_cols}})
+    away_recent = recent_snapshot.rename(columns={"team_code": "away_team_code", **{c: f"away_{c}" for c in recent_cols}})
+
+    out["home_team_code"] = out["home_team_code"].astype(str)
+    out["away_team_code"] = out["away_team_code"].astype(str)
+    out = out.merge(home_recent, on="home_team_code", how="left")
+    out = out.merge(away_recent, on="away_team_code", how="left")
+
+    for base_col in [c for c in recent_base_cols if c in recent_cols]:
+        out[f"{base_col}_diff"] = out[f"home_{base_col}"] - out[f"away_{base_col}"]
+
+    if {"home_rest_days", "away_rest_days"}.issubset(out.columns):
+        out["rest_days_diff"] = out["home_rest_days"] - out["away_rest_days"]
+    else:
+        out["rest_days_diff"] = 0
+
+    if {"home_prev_game_win", "away_prev_game_win"}.issubset(out.columns):
+        out["prev_game_win_diff"] = out["home_prev_game_win"] - out["away_prev_game_win"]
+    else:
+        out["prev_game_win_diff"] = 0
+
+    recent_needed = [c for c in feature_cols_core if c.startswith("recent_") or c in ["rest_days_diff", "prev_game_win_diff"]]
+    out[recent_needed] = out[recent_needed].fillna(0)
+
+    missing_after = [c for c in feature_cols_core if c not in out.columns]
+    print("missing feature cols after recent merge:", missing_after)
+    display(out[["game_id", "game_date", "home_team_code", "away_team_code"] + recent_needed])
+    return out
+
+
